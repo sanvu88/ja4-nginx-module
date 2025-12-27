@@ -1,165 +1,190 @@
-# NOTICE
+# ja4-nginx-module
 
-Development for JA4 on Nginx has been on pause due to other priorities taking development resources. This version of JA4 has known issues and bugs and may not produce correct JA4 values. Use at your own risk. We will continue development here as soon as resources become available. If you have questions, feel free to reach out to us at info@foxio.io.
+This repository contains an Nginx module that generates [JA4](https://github.com/FoxIO-LLC/ja4) fingerprints. It includes the necessary Nginx patches and module source code to integrate JA4 fingerprinting into your Nginx server.
 
-# JA4 on Nginx
+**Note:** Development for JA4 on Nginx is currently paused. This version may have known issues. Use at your own risk.
 
-This repository contains an nginx module that generates fingerprints from the JA4 suite. Additionally, a small patch to the nginx core is provided and necessary to for the module to function.
+## Quick Start with Docker
 
-## Usage
+You can easily build and run the Nginx server with the JA4 module using Docker Compose. This uses the `docker-compose.yaml` file in the root directory.
 
-Docker images and compose files are available in `./docker`. The QUIC and ModSecurity images are still WIP.
+1.  Clone the repository:
+    ```bash
+    git clone https://github.com/vncloudsco/ja4-nginx-module.git
+    cd ja4-nginx-module
+    ```
 
-You can quickly test out this module with:
-1. `cd docker`
-2. `docker-compose up --build`
+2.  Start the service:
+    ```bash
+    docker-compose up --build
+    ```
 
-A multi-stage `Dockerfile` is also included in the project root. You can run the build directly from the root using:
+This will build the image locally and start Nginx on ports **80** (HTTP) and **443** (HTTPS).
 
-```bash
-docker-compose up --build
-```
+### Docker Configuration
+The `docker-compose.yaml` mounts the configuration files from `nginx_utils/`:
+- `nginx.conf`: Main Nginx configuration.
+- `server.crt` / `server.key`: SSL certificates.
+- `logs/`: Directory for Nginx logs.
 
-You can also build from source with:
+## Building from Source (Nginx Integration)
 
-1. `docker build -t ja4-nginx:source .`
-2. `docker run -p 80:80 -p 443:443 ja4-nginx:source`
+To build Nginx with the JA4 module manually, follow these steps.
+
+### Prerequisites
+- Nginx source code (tested with v1.25.0)
+- OpenSSL source code (tested with v3.2.1)
+- Build tools: `gcc`, `make`, `patch`, `perl`, `zlib-dev`, `pcre-dev`, `openssl-dev`
+
+### Build Steps
+
+1.  **Download Sources**:
+    Download and extract Nginx and OpenSSL.
+    ```bash
+    wget https://nginx.org/download/nginx-1.25.0.tar.gz
+    tar -zxf nginx-1.25.0.tar.gz
+
+    wget https://github.com/openssl/openssl/releases/download/openssl-3.2.1/openssl-3.2.1.tar.gz
+    tar -zxf openssl-3.2.1.tar.gz
+    ```
+
+2.  **Apply Patch**:
+    Apply the provided patch to the Nginx source.
+    ```bash
+    cd nginx-1.25.0
+    patch -p1 < /path/to/ja4-nginx-module/patches/nginx.patch
+    ```
+
+3.  **Configure and Build**:
+    Configure Nginx to include the JA4 module. Point `--add-module` to the `src` directory of this repo.
+    ```bash
+    ./configure \
+        --with-openssl=../openssl-3.2.1 \
+        --add-module=/path/to/ja4-nginx-module/src \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --with-http_v3_module \
+        --prefix=/etc/nginx
+
+    make
+    make install
+    ```
 
 ## Testing
 
-Integration tests run inside Docker and validate the module’s behavior against predefined scenarios using golden files in `testdata/`.
+Integration tests are available to validate the module's behavior.
 
-Run tests:
+1.  Install dependencies (requires `pytest`):
+    ```bash
+    pip install pytest
+    ```
 
-```bash
-pytest
-```
+2.  Run tests:
+    ```bash
+    pytest
+    ```
 
-Update golden files:
+3.  Update "golden" files (if you are making changes):
+    ```bash
+    pytest --record
+    ```
 
-```bash
-pytest --record
-```
+## Nginx Configuration
 
-Current coverage includes various TLS versions, HTTP protocols, and ALPN/cipher/extension combinations.
+The module exposes JA4 fingerprints as Nginx variables.
 
+### Variables
+- `$http_ssl_ja4`: The JA4 fingerprint.
+- `$http_ssl_ja4h`: The JA4 hash.
+- `$http_ssl_ja4one`: JA4 single packet fingerprint.
 
-## Docker
+### Example Usage
+In your `nginx.conf`:
 
-We publish and host Docker images of release versions on GitHub Container Registry. You can pull the image with the following command:
+```nginx
+http {
+    log_format main '$remote_addr - ... "$http_ssl_ja4"';
 
-`docker pull ghcr.io/foxio-llc/ja4-nginx-module:v0.9.0-beta`
-
-### Debugging
-
-To develop and debug the Dockerfile container, I find it useful to run docker with `--progress=plain`.
-
-## Developer Guide
-
-If you want to develop this module, you should head to the [ja4-nginx fork](https://github.com/FoxIO-LLC/ja4-nginx). There, you can load this module into a fork of the nginx source code and build it.
-
-## Creating a Release
-
-1. Tag the release
-`git tag -a vx.y.z-beta -m "Release version x.y.z"`
-2. Run script
-`./release.sh`
-3. Push tag to GitHub
-`git push origin vx.y.z-beta`
-4. Create a release on GitHub
-Manually upload the tar.gz file and the sha256sum
-
-### Release a Docker Image to GitHub Container Registry
-
-Update the file `docker/Dockerfile` to pull from the most recently published release. Then build and tag the image:
-`cd docker`
-READ BELOW
-UPDATE JA4_MODULE_VERSION IN DOCKERFILE TO BUILD FROM NEW RELEASE
-`docker build -t ghcr.io/foxio-llc/ja4-nginx-module:vx.y.z-beta .`
-
-Then push the image to the GitHub Container Registry:
-`docker push ghcr.io/foxio-llc/ja4-nginx-module:vx.y.z-beta`
-
-## Architecture
-
-### Nginx Variables
-
-We create an Nginx variable for each JA4 fingerprint.
-
-These can be accessed through configuration files for logging purposes, in server definition blocks for custom headers, etc.
-
-All of the logic around these variables are in two files:
-
-1. `ngx_http_ja4_module.c`
-2. `ngx_http_ja4_module.h`
-
-#### Nginx Configuration
-
-An Nginx variable simply needs a string for its name, and a function that calculates and returns the value.
-
-By using this syntax:
-
-```C
-static ngx_http_variable_t ngx_http_ssl_ja4_variables_list[] = {
-    {ngx_string("http_ssl_ja4"),
-     NULL,
-     ngx_http_ssl_ja4,
-     0, 0, 0},
+    server {
+        listen 443 ssl;
+        
+        # Add JA4 header to responses
+        add_header X-JA4 $http_ssl_ja4;
+        
+        # Access control based on JA4 fingerprint
+        location / {
+            # Example: deny specific fingerprints
+            ja4_deny t13d1516h2_8daaf6152771_bc9a4605e104;
+        }
+    }
 }
 ```
 
-The function the variable maps to, in this case `ngx_http_ssl_ja4`, receives the request sent to Nginx, a variable that will store the result, and a pointer to the variable's data.
+## Access Control & Blocking
 
-```C
-static ngx_int_t ngx_http_ssl_ja4(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+The module provides dedicated directives to allow or deny traffic based on JA4 fingerprints. These directives work similarly to Nginx's built-in `allow` and `deny` rules: the **first matching rule** wins.
+
+### Available Directives
+- **JA4 (TLS)**: `ja4_allow`, `ja4_deny`
+- **JA4H (HTTP)**: `ja4h_allow`, `ja4h_deny`
+- **JA4One (Single Packet)**: `ja4one_allow`, `ja4one_deny`
+
+All directives accept a specific fingerprint string or the keyword `all`.
+
+### Case Studies
+
+#### Case 1: Blocking a Malicious Bot (Blacklist)
+You have identified a bot with a specific JA4 fingerprint (`t13d1516h2_8daaf6152771_bc9a4605e104`) that you want to block globally.
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name example.com;
+
+    location / {
+        # Block this specific bad actor
+        ja4_deny t13d1516h2_8daaf6152771_bc9a4605e104;
+        
+        # Allow everyone else (implicit, but can be explicit with ja4_allow all;)
+    }
+}
 ```
 
-So, this function is called for each request and it is expected to return the data intended for the variable.
+#### Case 2: Whitelist Mode (API Security)
+You have a private API that should only be accessed by your own mobile app or specific clients. You want to block all other TLS signatures.
 
-In this function, we call two important functions. First:
+```nginx
+location /api/ {
+    # Allow your mobile app fingerprint
+    ja4_allow t13d1516h2_8daaf6152771_bc9a4605e104;
+    
+    # Allow a partner's service
+    ja4_allow t13d1516h2_e7d70545501f_8665089e9e54;
 
-```C
-int ngx_ssl_ja4(ngx_connection_t *c, ngx_pool_t *pool, ngx_ssl_ja4_t *ja4);
+    # Deny everyone else
+    ja4_deny all;
+}
 ```
 
-The first gets the connection object from the request (This is an Nginx native structure that we've modified with the `ja4-nginx` repository to store additional data for the JA4 fingerprint), pulls in SSL data from that object, and processes it to be stored in a custom structure (defined in the header file) for this module's Nginx variable.
+#### Case 3: Blocking HTTP Scrapers via JA4H
+Some scrapers might rotate their TLS fingerprint (JA4) but keep the same HTTP headers (JA4H). You can block them using `ja4h_deny`.
 
-For this example:
-
-```C
-typedef struct ngx_ssl_ja4_s
-{
-    const char *version; // TLS version
-
-    unsigned char transport; // 'q' for QUIC, 't' for TCP
-
-    unsigned char has_sni; // 'd' if SNI is present, 'i' otherwise
-
-    size_t ciphers_sz;       // Count of ciphers
-    unsigned short *ciphers; // List of ciphers
-
-    size_t extensions_sz;       // Count of extensions
-    unsigned short *extensions; // List of extensions
-
-    size_t sigalgs_sz;       // Count of signature algorithms
-    char **sigalgs; // List of signature algorithms
-
-    // For the first and last ALPN extension values
-    char *alpn_first_value;
-
-    char cipher_hash[65];           // 32 bytes * 2 characters/byte + 1 for '\0'
-    char cipher_hash_truncated[13]; // 12 bytes * 2 characters/byte + 1 for '\0'
-
-    char extension_hash[65];           // 32 bytes * 2 characters/byte + 1 for '\0'
-    char extension_hash_truncated[13]; // 6 bytes * 2 characters/byte + 1 for '\0'
-
-} ngx_ssl_ja4_t;
+```nginx
+location / {
+    # Block a scraper with a specific HTTP header fingerprint
+    ja4h_deny ge11nn020000_d4cd99874e44_122421334455;
+    
+    # Block a curl client (example fingerprint)
+    ja4h_deny ge11nn020000_d4cd99874e44_556677889900;
+}
 ```
 
-The second important function is the one that actually calculates the JA4 fingerprint:
+#### Case 4: Advanced Filtering with JA4One
+If you are mitigating a DDoS attack and only have the first packet information, you can use `ja4one`.
 
-```C
-void ngx_ssl_ja4_fp(ngx_pool_t *pool, ngx_ssl_ja4_t*ja4, ngx_str_t *out);
+```nginx
+location / {
+    # Block traffic based on the first packet fingerprint
+    ja4one_deny t13d151600_8daaf6152771_bc9a4605e104;
+}
 ```
-
-It simply takes the data structure and uses it to calculate what the single string value of the JA4 fingerprint should be.

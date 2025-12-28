@@ -406,20 +406,60 @@ Now that we understand the network fundamentals, let's examine how the `ja4-ngin
 Nginx processes requests through a series of **phases**. The JA4 module hooks into two specific phases:
 
 ```mermaid
-graph LR
-    A[TCP Accept] --> B[TLS Handshake]
-    B --> C{SSL Callback}
-    C -->|JA4 Module<br/>CAPTURES DATA| D[Store in ex_data]
-    D --> E[HTTP Parse]
-    E --> F[Access Phase]
-    F --> G{JA4 Module<br/>CHECKS RULES}
-    G -->|Deny| H[403 Forbidden]
-    G -->|Allow| I[Content Phase]
-    I --> J[Response]
+sequenceDiagram
+    participant Client
+    participant Nginx as Nginx Core
+    participant SSL as SSL/TLS Layer
+    participant JA4_CB as JA4 Module<br/>(ClientHello Callback)
+    participant Store as ex_data Storage
+    participant HTTP as HTTP Parser
+    participant JA4_ACC as JA4 Module<br/>(Access Phase)
+    participant Config as nginx.conf Rules
+    participant Content as Content Generator
     
-    style C fill:#ff6b6b,stroke:#c92a2a,color:#fff
-    style G fill:#ff6b6b,stroke:#c92a2a,color:#fff
+    Note over Client,Nginx: TCP Connection Established
+    
+    Client->>Nginx: TLS ClientHello
+    Nginx->>SSL: Process Handshake
+    SSL->>JA4_CB: 🔴 Trigger: SSL_client_hello_cb()
+    activate JA4_CB
+    Note over JA4_CB: INTERVENTION POINT #1
+    JA4_CB->>JA4_CB: Extract Ciphers & Extensions
+    JA4_CB->>JA4_CB: Parse Supported Versions
+    JA4_CB->>JA4_CB: Detect SNI presence
+    JA4_CB->>Store: SSL_set_ex_data(raw_data)
+    JA4_CB-->>SSL: Return SUCCESS
+    deactivate JA4_CB
+    
+    SSL->>Client: ServerHello + Certificate
+    Note over Client,SSL: TLS Handshake Complete
+    
+    Client->>Nginx: HTTP Request (GET /)
+    Nginx->>HTTP: Parse Headers
+    HTTP->>JA4_ACC: NGX_HTTP_ACCESS_PHASE
+    activate JA4_ACC
+    Note over JA4_ACC: INTERVENTION POINT #2
+    JA4_ACC->>Store: SSL_get_ex_data(raw_data)
+    Store-->>JA4_ACC: Return TLS data
+    JA4_ACC->>JA4_ACC: Calculate JA4 fingerprint
+    JA4_ACC->>JA4_ACC: Calculate JA4H fingerprint
+    JA4_ACC->>Config: Check ja4_deny/ja4_allow rules
+    
+    alt Fingerprint matches DENY rule
+        Config-->>JA4_ACC: Match found
+        JA4_ACC-->>Nginx: Return NGX_HTTP_FORBIDDEN
+        Nginx->>Client: 403 Forbidden
+    else No match or ALLOW rule
+        Config-->>JA4_ACC: No deny match
+        JA4_ACC-->>Nginx: Return NGX_DECLINED
+        Nginx->>Content: Generate response
+        Content-->>Nginx: HTML/JSON content
+        Nginx->>Client: 200 OK + Content
+    end
+    deactivate JA4_ACC
 ```
+
+
 
 ### 4.2 Intervention Point #1: SSL ClientHello Callback
 

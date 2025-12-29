@@ -85,31 +85,58 @@ graph TD
    **TCP Window Size varies significantly by OS version:**
    
    - **Modern Linux** (kernel 3.x+):
-     - Default: ~64,240 bytes (varies by distribution)
-     - Ubuntu 20.04+: 131,072 bytes (128 KB) with window scaling enabled
-     - Older kernels (2.4/2.6): 5,840 bytes
-     - Window scale factor: typically 7
-     - Options order: `MSS, SACK-Permitted, Timestamp, NOP, Window-Scale`
+     - **Configuration via `tcp_rmem`**: Defines min, default, max receive buffer sizes
+     - **Common defaults** (Ubuntu 22.04): `tcp_rmem = 8192 43690 16777216`
+       - Minimum: 8,192 bytes
+       - **Default: 43,690 bytes** (some distributions use 87,380 bytes)
+       - Maximum: 16,777,216 bytes (16 MB) with auto-tuning
+     - **Observed in SYN packet**: Typically ~43,690 bytes or distribution-specific value
+     - **Older kernels** (2.4/2.6): **5,840 bytes** (verified via Nmap/p0f signatures)
+     - Window scale factor: Typically 7 (allows 43,690 × 2^7 = 5.6 MB effective window)
+     - Options order: `MSS, SACK-Permitted, Timestamp, NOP, Window-Scale` (from p0f database)
      - Configuration: `/proc/sys/net/ipv4/tcp_rmem` and `tcp_wmem`
+     
+     **Sources**: 
+     - [Ubuntu Server Tuning](https://ubuntu.com/server/docs/network-tuning) - tcp_rmem defaults
+     - [Nmap OS Detection](https://nmap.org/book/osdetect.html) - Old kernel signatures
    
    - **Windows**:
-     - Windows 7/8/10/11: **8,192 bytes** (common initial window in default config)
-     - Windows XP/2003 (legacy): 65,535 bytes or 17,520 bytes (12 × MSS of 1,460)
-     - Window scale factor: typically 8
-     - Options order: `MSS, NOP, Window-Scale, NOP, NOP, SACK-Permitted`
-     - TCP autotuning enabled (can scale up to 16 MB dynamically)
+     - **Windows 10/11**: Initial SYN advertises **16,384 bytes (16KB)**, uses auto-tuning after handshake
+       - With window scaling: Typically **65,535 bytes** × scale factor (effective window up to 1GB)
+       - Auto-tuning: **Enabled by default** ("Receive Window Auto-Tuning" dynamically adjusts)
+       - Observed in fingerprints: Often shows 65,535 in SYN due to scaling
+     - **Windows 7/Vista**: **8,192 bytes** (static initial window)
+     - **Windows XP/2003** (legacy): 65,535 bytes or 17,520 bytes (12 × MSS of 1,460)
+     - Window scale factor: Typically 2-8 (negotiated during handshake)
+     - Options order: `MSS, NOP, Window-Scale, NOP, NOP, SACK-Permitted` (from p0f database)
      - Configuration: Registry `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`
+     
+     **Source**: [Microsoft TCP/IP Features](https://docs.microsoft.com/en-us/troubleshoot/windows-server/networking/description-tcp-features)
    
    - **macOS** (BSD-derived):
-     - Default: ~65,535 bytes (varies by macOS version)
-     - Supports dynamic window scaling
-     - Options order similar to BSD: `MSS, NOP, Window-Scale, SACK-Permitted, Timestamp`
-     - Configuration: `sysctl` parameters
+     - **Traditional initial window**: ~65,535 bytes (max without window scaling)
+     - **Auto-tuning** (macOS 10.5+): Enabled by default via "self-tuning TCP"
+       - `net.inet.tcp.autorcvbufmax = 4194304` (4 MB max auto-tune receive)
+       - `net.inet.tcp.autosndbufmax = 4194304` (4 MB max auto-tune send)
+       - `net.inet.tcp.win_scale_factor = 3` (default scale factor: 2^3 = 8x multiplier)
+     - **Effective window**: Up to 4 MB with RFC 1323 window scaling
+     - Options order: `MSS, NOP, Window-Scale, SACK-Permitted, Timestamp` (from p0f database)
+     - Configuration: `sysctl net.inet.tcp.*` parameters
+     
+     **Source**: [ESnet macOS Tuning](https://fasterdata.es.net/host-tuning/osx/)
    
    **Why Different?** Each OS has distinct TCP stack implementations:
-   - Linux: `net/ipv4/tcp_output.c` in kernel source
-   - Windows: `tcpip.sys` driver
-   - macOS: BSD-derived TCP stack with Apple modifications
+   - **Linux**: `net/ipv4/tcp_output.c` in kernel source ([GitHub](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_output.c))
+   - **Windows**: `tcpip.sys` driver with Receive Window Auto-Tuning (Vista+)
+   - **macOS**: BSD-derived TCP stack with Apple self-tuning modifications
+   
+   > [!WARNING]
+   > **Important Note on TCP Option Ordering**: The option orderings listed above are based on the [p0f v3 passive fingerprinting database](http://lcamtuf.coredump.cx/p0f3/). However, p0f's signature database was last comprehensively updated circa 2012 and may not reflect TCP stack changes in:
+   > - Windows 10/11 (p0f may misidentify as Windows 7 or XP)
+   > - Recent macOS versions (Ventura/Sonoma)
+   > - Linux distributions with custom kernel patches or updated TCP stacks
+   > 
+   > For production deployments, capture actual SYN packets from target platforms to verify current fingerprints.
    
    **Source References**: 
    - [p0f v3](http://lcamtuf.coredump.cx/p0f3/) - Passive OS fingerprinting database with TCP signatures
@@ -121,8 +148,8 @@ graph TD
 2. **Application-Layer Differences**:
    
    **Browsers** use OS-default TCP settings:
-   - Chrome on Windows 10: Inherits Windows' 8,192 byte window
-   - Chrome on Linux: Inherits Linux's ~64,240 byte window
+   - **Chrome on Windows 10**: Inherits Windows' 16,384 byte initial window (often 65,535 with scaling)
+   - **Chrome on Linux**: Inherits Linux's ~43,690 byte window (from tcp_rmem default)
    - **Result**: Same browser, different TCP fingerprints on different OS
    
    **Automation Tools** often have distinct signatures:
@@ -132,8 +159,8 @@ graph TD
    
    **Real-World Example** (Chrome browser on different OS):
    ```
-   Chrome/Linux (Ubuntu 22.04):    64240_2-4-8-1-3_1460_7
-   Chrome/Windows 10:              8192_2-1-3-1-1-8-1-1_1460_8
+   Chrome/Linux (Ubuntu 22.04):    43690_2-4-8-1-3_1460_7
+   Chrome/Windows 10:              65535_2-1-3-1-1-8-1-1_1460_8    (with scaling)
    Chrome/macOS (Ventura):         65535_2-3-4-1-1-8_1440_4
    ```
    
@@ -1446,12 +1473,12 @@ Different platforms and applications produce distinct TCP fingerprints. The valu
 
 | Client | Fingerprint | Notes |
 |--------|-------------|-------|
-| **Chrome/Windows 10** | `8192_2-1-3-1-1-8-1-1_1460_8` | Standard Windows 10 TCP stack, autotuning enabled |
-| **Chrome/Linux (Ubuntu 22.04)** | `64240_2-4-8-1-3_1460_7` | Modern Linux kernel with larger default window |
+| **Chrome/Windows 10** | `65535_2-1-3-1-1-8-1-1_1460_8` | Windows 10/11 with window scaling, autotuning enabled |
+| **Chrome/Linux (Ubuntu 22.04)** | `43690_2-4-8-1-3_1460_7` | Modern Linux kernel, tcp_rmem default value |
 | **Chrome/macOS (Ventura)** | `65535_2-3-4-1-1-8_1440_4` | BSD-derived stack, slightly smaller MSS |
-| **curl (Linux)** | `64240_2-4-8-1-3_1460_7` | Uses OS defaults (matches Linux browsers) |
+| **curl (Linux)** | `43690_2-4-8-1-3_1460_7` | Uses OS defaults (matches Linux browsers) |
 | **Python requests (Linux)** | `29200_2-4-8-1-3_1460_7` | Smaller custom window, uses OS option ordering |
-| **Go net/http (Linux)** | `64240_2-4-8-1-3_1460_7` | Inherits from Go runtime but uses OS TCP stack |
+| **Go net/http (Linux)** | `43690_2-4-8-1-3_1460_7` | Inherits from Go runtime but uses OS TCP stack |
 | **Loopback (127.0.0.1)** | `65535_2-4-8-3_65496_7` | Loopback interface MTU is 65536, MSS = 65536 - 40 = 65496 |
 
 **Important Notes**:
@@ -1503,9 +1530,9 @@ graph TD
 **Example Multi-Layer Detection**:
 ```
 Client Claims: Chrome 120 / Windows 11
-JA4TCP: 8192_2-1-3-1-1-8-1-1_1460_8  ✅ Matches Windows 10/11
-JA4:    t13d1012_...                 ✅ Matches Chrome 120
-JA4H:   ge11c08_...                  ✅ Matches Chrome Headers
+JA4TCP: 65535_2-1-3-1-1-8-1-1_1460_8  ✅ Matches Windows 10/11 (with scaling)
+JA4:    t13d1012_...                  ✅ Matches Chrome 120
+JA4H:   ge11c08_...                   ✅ Matches Chrome Headers
 
 → VERDICT: Legitimate Chrome on Windows
 ```
@@ -1524,7 +1551,7 @@ JA4H:   ge11n03_...                  ⚠️  Only 3 headers (suspicious)
 **Cross-Platform Mismatch Detection**:
 ```
 Client Claims: Safari / iOS 15
-JA4TCP: 64240_2-4-8-1-3_1460_7       ❌ Linux signature (Ubuntu)
+JA4TCP: 43690_2-4-8-1-3_1460_7       ❌ Linux signature (Ubuntu)
 JA4:    t13d0912_...                 ✅ Could match Safari
 JA4H:   ge20c12_...                  ⚠️  HTTP/2 with Linux-like headers
 

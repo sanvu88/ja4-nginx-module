@@ -81,8 +81,8 @@ server {
     # Block a specific curl client via JA4H
     ja4h_deny "ge11n03_fe444ad14866d725a8e22320d4ed56810819b0fae0efae0c09bedfdd";
     
-    # Block suspicious TCP fingerprints
-    ja4tcp_deny "65535_5840_1_64_m";
+    # Block suspicious TCP fingerprints (example pattern)
+    ja4tcp_deny "29200_2-4-8-1-3_1460_7";  # Python-like small window
 
     location / {
         # Allow specific bot via JA4one
@@ -106,13 +106,12 @@ Due to the full hash modification, the formats are:
     - `11`: HTTP 1.1
     - `n`: No Cookie
     - `03`: 3 Headers
-- **JA4TCP**: `<window_size>_<options_length>_<flags>_<ttl>_<mode>`
-    - Example: `65535_5840_1_64_m`
-    - `window_size`: TCP window size
-    - `options_length`: Length of TCP options
-    - `flags`: TCP flags (1 = SYN)
-    - `ttl`: Time to Live
-    - `mode`: m (modern) or l (legacy)
+- **JA4TCP**: `<window>_<option_kinds>_<mss>_<scale>`
+    - Example: `65535_2-4-8-3_1460_7`
+    - `window`: TCP window size (decimal)
+    - `option_kinds`: TCP option kinds in order (decimal, dash-separated, NOPs included)
+    - `mss`: Maximum Segment Size (decimal)
+    - `scale`: Window scale factor (decimal)
 - **JA4one**: `[JA4]_[JA4H]` (Concatenated)
 
 ## Usage Examples
@@ -171,8 +170,8 @@ server {
     server_name api.example.com;
     
     # Block suspicious TCP patterns (typical of bots/scanners)
-    ja4tcp_deny "1024_1460_2_128_l";
-    ja4tcp_deny "8192_1460_2_64_l";
+    ja4tcp_deny "1024_2-4-8_1460_0";     # Unusual small window
+    ja4tcp_deny "29200_2-4-8-1-3_1460_7"; # Python requests pattern
     
     # Block known malicious JA4H patterns
     ja4h_deny "po11n00_8b3f...";

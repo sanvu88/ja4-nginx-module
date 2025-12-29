@@ -9,18 +9,485 @@ This document provides a comprehensive technical analysis of the `ja4-nginx-modu
 **Purpose of This Module**: The `ja4-nginx-module` integrates JA4 fingerprinting directly into Nginx, enabling real-time detection and blocking of malicious clients, bots, and security tools attempting to intercept traffic.
 
 **What You'll Learn**:
-1. **Network Fundamentals**: OSI Model, TCP connections, and TLS handshakes explained from the ground up
-2. **Intervention Points**: Exactly where and how this module intercepts connection data at Layers 4, 6, and 7
-3. **Algorithms**: Complete breakdown of JA4TCP, JA4, JA4H, and JA4ONE calculation methods
-4. **Practical Examples**: Step-by-step walkthrough with real hex values and packet captures
+1. **Why Fingerprinting Works**: The fundamental network protocol characteristics that make JA4, JA4H, JA4TCP, and JA4ONE calculation possible
+2. **Network Fundamentals**: OSI Model, TCP connections, and TLS handshakes explained from the ground up
+3. **Intervention Points**: Exactly where and how this module intercepts connection data at Layers 4, 6, and 7
+4. **Algorithms**: Complete breakdown of JA4TCP, JA4, JA4H, and JA4ONE calculation methods
+5. **Practical Examples**: Step-by-step walkthrough with real hex values and packet captures
 
 ---
 
-## 2. Network Fundamentals
+## 2. Why Fingerprinting is Possible: Technical Foundation
+
+Before diving into the implementation details, it's crucial to understand **why** we can calculate these fingerprints at all. The ability to perform JA4, JA4H, JA4ONE, and JA4TCP fingerprinting is not a vulnerability or exploit—it's a natural consequence of how network protocols are designed.
+
+### 2.1 The Fundamental Principle: Visibility by Design
+
+**Core Concept**: Network protocols are designed for **interoperability**, not privacy. To establish connections, clients must declare their capabilities in standardized, machine-readable formats.
+
+```mermaid
+graph LR
+    A[Client] -->|Must Declare Capabilities| B[Handshake Messages]
+    B -->|Unencrypted/Observable| C[Server/Middlebox]
+    C -->|Can Extract & Analyze| D[Unique Fingerprint]
+    
+    style B fill:#ffe1e1
+    style D fill:#e1ffe1
+```
+
+**Key Insight**: Fingerprinting is possible because:
+1. **Handshake messages are transmitted before encryption** (for TLS/TCP)
+2. **Standardized formats** make parsing deterministic
+3. **Client diversity** creates unique patterns
+4. **Operating system/library implementations** leave distinctive signatures
+
+### 2.2 Why JA4TCP Can Be Calculated
+
+**JA4TCP** fingerprints the TCP SYN packet—the very first packet sent during connection establishment.
+
+#### 2.2.1 TCP SYN Packet Characteristics
+
+**Why It's Observable**:
+1. **Unencrypted by Nature**: TCP operates at Layer 4 (Transport), below any encryption layer
+2. **Mandatory Transmission**: Every TCP connection begins with a SYN packet
+3. **Rich Option Set**: TCP options reveal OS-level network stack configuration
+
+**What Makes It Fingerprintable**:
+
+```mermaid
+graph TD
+    A[TCP SYN Packet] --> B[Window Size]
+    A --> C[TCP Options]
+    A --> D[MSS Value]
+    A --> E[Window Scale]
+    
+    B --> F[OS-Specific Default]
+    C --> G[Stack Implementation]
+    D --> H[MTU Configuration]
+    E --> I[Buffer Configuration]
+    
+    F --> J[Unique Signature]
+    G --> J
+    H --> J
+    I --> J
+    
+    style A fill:#e1f5ff
+    style J fill:#ffe1f5
+```
+
+**Technical Reasons**:
+
+1. **Operating System Signatures** (Version-Specific):
+   
+   > [!NOTE]
+   > The values below are **representative examples** based on default configurations. Actual TCP parameters can be modified via system settings, kernel parameters, or network tuning, and may vary across different OS versions and distributions.
+   
+   **TCP Window Size varies significantly by OS version:**
+   
+   - **Modern Linux** (kernel 3.x+):
+     - Default: ~64,240 bytes (varies by distribution)
+     - Ubuntu 20.04+: 131,072 bytes (128 KB) with window scaling enabled
+     - Older kernels (2.4/2.6): 5,840 bytes
+     - Window scale factor: typically 7
+     - Options order: `MSS, SACK-Permitted, Timestamp, NOP, Window-Scale`
+     - Configuration: `/proc/sys/net/ipv4/tcp_rmem` and `tcp_wmem`
+   
+   - **Windows**:
+     - Windows 7/8/10/11: **8,192 bytes** (common initial window in default config)
+     - Windows XP/2003 (legacy): 65,535 bytes or 17,520 bytes (12 × MSS of 1,460)
+     - Window scale factor: typically 8
+     - Options order: `MSS, NOP, Window-Scale, NOP, NOP, SACK-Permitted`
+     - TCP autotuning enabled (can scale up to 16 MB dynamically)
+     - Configuration: Registry `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`
+   
+   - **macOS** (BSD-derived):
+     - Default: ~65,535 bytes (varies by macOS version)
+     - Supports dynamic window scaling
+     - Options order similar to BSD: `MSS, NOP, Window-Scale, SACK-Permitted, Timestamp`
+     - Configuration: `sysctl` parameters
+   
+   **Why Different?** Each OS has distinct TCP stack implementations:
+   - Linux: `net/ipv4/tcp_output.c` in kernel source
+   - Windows: `tcpip.sys` driver
+   - macOS: BSD-derived TCP stack with Apple modifications
+   
+   **Source References**: 
+   - [p0f v3](http://lcamtuf.coredump.cx/p0f3/) - Passive OS fingerprinting database with TCP signatures
+   - [Nmap OS Detection](https://nmap.org/book/osdetect.html) - Comprehensive OS fingerprinting via TCP/IP stack analysis
+   - [RFC 1323](https://tools.ietf.org/html/rfc1323) - TCP Extensions for High Performance (Window Scaling)
+   - [RFC 7323](https://tools.ietf.org/html/rfc7323) - TCP Extensions for High Performance (updated)
+   - Linux kernel source: [`net/ipv4/tcp_output.c`](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_output.c)
+
+2. **Application-Layer Differences**:
+   
+   **Browsers** use OS-default TCP settings:
+   - Chrome on Windows 10: Inherits Windows' 8,192 byte window
+   - Chrome on Linux: Inherits Linux's ~64,240 byte window
+   - **Result**: Same browser, different TCP fingerprints on different OS
+   
+   **Automation Tools** often have distinct signatures:
+   - **Python `requests`**: Smaller window (29,200 bytes), custom options order
+   - **curl**: Uses libcurl's defaults, often differs from browser stacks
+   - **Go net/http**: Go runtime's TCP implementation, unique patterns
+   
+   **Real-World Example** (Chrome browser on different OS):
+   ```
+   Chrome/Linux (Ubuntu 22.04):    64240_2-4-8-1-3_1460_7
+   Chrome/Windows 10:              8192_2-1-3-1-1-8-1-1_1460_8
+   Chrome/macOS (Ventura):         65535_2-3-4-1-1-8_1440_4
+   ```
+   
+   **Why Same Browser ≠ Same Fingerprint?** 
+   - Browser (Chrome) doesn't control TCP layer - OS does
+   - Window size set by OS kernel, not application
+   - TCP option ordering determined by OS TCP/IP stack
+   - MSS calculated from network interface MTU (OS-level)
+
+3. **Kernel Visibility**:
+   **Why We Can Capture It**:
+   - Linux kernel provides `TCP_SAVE_SYN` socket option (introduced in kernel 4.5+)
+   - This instructs the kernel to save a copy of the original SYN packet
+   - NGINX module retrieves it via `TCP_SAVED_SYN` on accepted connections
+   
+   **Code Path**:
+   ```
+   [Client] → SYN packet → [Kernel] → (saved to socket buffer)
+                                    ↓
+                           [accept() in NGINX]
+                                    ↓
+                           [getsockopt(TCP_SAVED_SYN)]
+                                    ↓ 
+                           [JA4TCP module parses raw bytes]
+   ```
+
+#### 2.2.2 Why It's Difficult to Spoof
+
+**Challenge 1: OS-Level Settings**:
+- Modifying TCP options requires low-level socket programming or kernel modifications
+- Most HTTP libraries (requests, urllib, fetch API) don't expose TCP option control
+
+**Challenge 2: Consistency Requirements**:
+- Spoofing requires matching window size, MSS, scale factor, AND option order
+- Mismatch at TCP layer but match at TLS layer reveals deception
+
+### 2.3 Why JA4 (TLS) Can Be Calculated
+
+**JA4** fingerprints the TLS ClientHello message—the first message in the TLS handshake.
+
+#### 2.3.1 TLS ClientHello Characteristics
+
+**Why It's Observable**:
+
+1. **Transmitted Unencrypted**: 
+   ```mermaid
+   sequenceDiagram
+       participant C as Client
+       participant S as Server
+       
+       Note over C,S: No encryption exists yet
+       C->>S: ClientHello (PLAINTEXT)
+       Note over S: ✅ Server can read all data
+       S->>C: ServerHello + Certificate
+       Note over C,S: Encryption negotiated
+       C->>S: Finished (ENCRYPTED)
+   ```
+   
+   **Why?** Encryption parameters are negotiated IN the ClientHello. The server must read the message to choose compatible algorithms.
+
+2. **Mandatory TLS Field**:
+   - **Cipher Suites**: Client MUST advertise supported encryption algorithms
+   - **Extensions**: Client MUST include supported features (SNI, ALPN, etc.)
+   - **Version**: Client MUST declare TLS version support
+   
+   **Why?** RFC 5246 (TLS 1.2) and RFC 8446 (TLS 1.3) require these fields for handshake negotiation.
+
+**What Makes It Fingerprintable**:
+
+```mermaid
+graph TD
+    A[ClientHello Message] --> B[Cipher Suite List]
+    A --> C[Extension List]
+    A --> D[Supported Versions]
+    A --> E[SNI Presence]
+    
+    B --> F[Browser/Library Preference]
+    C --> G[Feature Support]
+    D --> H[TLS Stack Version]
+    E --> I[Direct IP vs Domain]
+    
+    F --> J[Unique TLS Signature]
+    G --> J
+    H --> J
+    I --> J
+    
+    style A fill:#fff4e1
+    style J fill:#ffe1f5
+```
+
+**Technical Reasons**:
+
+1. **Browser/Library Implementations Differ**:
+   
+   **Chrome 120** (BoringSSL):
+   ```
+   Ciphers: [TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, 
+             TLS_CHACHA20_POLY1305_SHA256, ECDHE_ECDSA_...]
+   Extensions: [SNI, ALPN, SupportedVersions, KeyShare, ...]
+   ```
+   
+   **Firefox 120** (NSS):
+   ```
+   Ciphers: [TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256,
+             TLS_AES_256_GCM_SHA384, ...] ← Different order
+   Extensions: [SNI, SupportedGroups, ECPointFormats, ...] ← Different set
+   ```
+   
+   **Why Different?**
+   - Chrome uses BoringSSL (Google's TLS library)
+   - Firefox uses NSS (Mozilla's TLS library)
+   - Different cipher preference algorithms
+   - Different extension support priorities
+
+2. **GREASE Makes Filtering Necessary But Predictable**:
+   - Browsers insert random GREASE values (`0x0a0a`, `0x1a1a`, etc.)
+   - **Why filter?** GREASE changes per connection → unstable fingerprint
+   - **Why still works?** GREASE follows a standard pattern, easy to identify and remove
+
+3. **OpenSSL Callback API**:
+   **Why We Can Capture It**:
+   ```c
+   // OpenSSL provides direct access to ClientHello
+   SSL_CTX_set_client_hello_cb(ctx, callback, NULL);
+   
+   // Callback receives raw ClientHello data
+   int callback(SSL *s, int *al, void *arg) {
+       int *exts;
+       size_t num_exts;
+       SSL_client_hello_get1_extensions_present(s, &exts, &num_exts);
+       // ✅ Full visibility into extensions, ciphers, version
+   }
+   ```
+   
+   **Design Intent**: OpenSSL exposes ClientHello for SNI routing, custom certificate selection, and early data validation.
+
+#### 2.3.2 Why ECH (Encrypted ClientHello) Changes This
+
+**Problem with Standard TLS**: SNI and other extensions visible in plaintext.
+
+**ECH Solution** (RFC draft):
+- Encrypts sensitive extensions (SNI, ALPN)
+- **Outer ClientHello**: Contains generic/dummy values (visible to middleboxes)
+- **Inner ClientHello**: Contains real values (only server can decrypt)
+
+**Impact on JA4**:
+```mermaid
+graph LR
+    A[Standard TLS] -->|Full Visibility| B[Complete JA4]
+    C[TLS with ECH] -->|Outer ClientHello Only| D[Partial JA4]
+    
+    style A fill:#e1ffe1
+    style C fill:#ffe1e1
+```
+
+**Current Status**: ECH adoption is low (~5% of traffic as of 2024), so JA4 remains highly effective.
+
+### 2.4 Why JA4H (HTTP) Can Be Calculated
+
+**JA4H** fingerprints HTTP headers sent after TLS encryption is established.
+
+#### 2.4.1 HTTP Header Characteristics
+
+**Why It's Observable**:
+
+1. **NGINX Operates at Application Layer**:
+   ```mermaid
+   sequenceDiagram
+       participant C as Client
+       participant TLS as TLS Layer
+       participant NGINX as NGINX
+       
+       C->>TLS: Encrypted HTTP Request
+       TLS->>NGINX: Decrypted HTTP Headers
+       Note over NGINX: ✅ Full visibility (NGINX terminates TLS)
+       NGINX->>NGINX: JA4H Module Analyzes Headers
+   ```
+   
+   **Why?** NGINX is the TLS termination point—it decrypts all traffic before processing.
+
+2. **HTTP Headers Are Structured Text**:
+   ```http
+   GET / HTTP/1.1
+   Host: example.com
+   User-Agent: Mozilla/5.0...
+   Accept: text/html
+   Accept-Language: en-US
+   Accept-Encoding: gzip, deflate, br
+   Cookie: session=abc123
+   Connection: keep-alive
+   ```
+   
+   **Fingerprinting Uses**:
+   - **Method**: `GET` → `ge`
+   - **HTTP Version**: `HTTP/1.1` → `11`
+   - **Cookie Presence**: `Cookie: ...` → `c`
+   - **Header Names**: `[Host, User-Agent, Accept, ...]` → hashed
+
+**What Makes It Fingerprintable**:
+
+```mermaid
+graph TD
+    A[HTTP Request] --> B[Header Order]
+    A --> C[Header Set]
+    A --> D[Cookie Presence]
+    A --> E[HTTP Version]
+    
+    B --> F[Browser Implementation]
+    C --> G[Feature Support]
+    D --> H[Session State]
+    E --> I[Protocol Negotiation]
+    
+    F --> J[Unique HTTP Signature]
+    G --> J
+    H --> J
+    I --> J
+    
+    style A fill:#f0ffe1
+    style J fill:#ffe1f5
+```
+
+**Technical Reasons**:
+
+1. **Browser Header Ordering**:
+   - **Chrome**: Always sends `Host`, then `User-Agent`, then `Accept`
+   - **Firefox**: Different default order
+   - **Why?** Hard-coded in browser source code (Chromium's `net/http/http_request_headers.cc`)
+
+2. **Feature Detection**:
+   - **Modern Browsers**: Include `Accept-Encoding: br` (Brotli support)
+   - **curl**: Often only `gzip, deflate`
+   - **Python requests**: Default header set differs
+
+3. **HTTP/2 vs HTTP/1.1**:
+   - **HTTP/2**: Uses pseudo-headers (`:method`, `:path`)
+   - **HTTP/1.1**: Uses traditional headers
+   - **Detection**: ALPN negotiation in TLS reveals protocol choice
+
+#### 2.4.2 Why It's Difficult to Spoof
+
+**Challenge**: Must match both TLS (JA4) and HTTP (JA4H) signatures simultaneously.
+
+**Example Mismatch**:
+```
+Claimed: Chrome 120 / Windows 11
+JA4:  t13d0912_xxx_yyy  ✅ Matches Chrome
+JA4H: po11n05_zzz       ❌ Only 5 headers (Chrome sends ~12)
+                        ❌ POST method (user claimed GET request)
+                        ❌ No cookies (Chrome always has some)
+
+→ VERDICT: Bot with spoofed User-Agent
+```
+
+### 2.5 Why JA4ONE (Combined) is Powerful
+
+**JA4ONE** = `JA4_JA4H` (concatenated)
+
+**Power of Multi-Layer Fingerprinting**:
+
+```mermaid
+graph TD
+    A[Attacker Wants to Spoof Chrome]
+    A --> B[Spoof User-Agent Header]
+    B --> C{Check JA4H}
+    C -->|Match| D[Looks Legitimate at HTTP Layer]
+    D --> E{Check JA4 TLS}
+    E -->|Mismatch| F[❌ DETECTED: TLS signature wrong]
+    E -->|Match| G{Check JA4TCP}
+    G -->|Mismatch| H[❌ DETECTED: TCP signature wrong]
+    G -->|Match| I[✅ Likely Legitimate]
+    
+    style F fill:#ffe1e1
+    style H fill:#ffe1e1
+    style I fill:#e1ffe1
+```
+
+**Why It Works**:
+
+1. **Different Protocol Layers, Different APIs**:
+   - **TCP options**: Require `setsockopt()` with `IPPROTO_TCP`
+   - **TLS ciphers**: Require OpenSSL/BoringSSL/NSS library calls
+   - **HTTP headers**: Require application-level HTTP library configuration
+   
+   **Challenge for Attacker**: Must control all three layers simultaneously.
+
+2. **Library Coupling**:
+   - Most HTTP libraries (requests, urllib, fetch) use system TLS library
+   - TLS library uses OS TCP stack
+   - **Result**: Fingerprints are naturally correlated
+   
+   **Example** (Python `requests`):
+   ```
+   JA4TCP: 29200_2-4-8-3_1460_7      ← Python's TCP defaults
+   JA4:    t12i0508_abc123_def456    ← OpenSSL defaults
+   JA4H:   ge11n08_789abc...         ← requests header defaults
+   
+   All three correlate → Consistent "Python requests" signature
+   ```
+
+3. **Cross-Layer Validation**:
+   ```
+   IF (JA4 == Chrome) AND (JA4H == curl):
+       → IMPOSSIBLE: Chrome doesn't use curl's header set
+       → VERDICT: Spoofing attempt
+   ```
+
+### 2.6 Technical Limitations & Countermeasures
+
+#### 2.6.1 Scenarios Where Fingerprinting is Limited
+
+1. **VPN/NAT with TCP Proxying**:
+   - If VPN terminates TCP, module sees VPN's fingerprint
+   - **Mitigation**: Use TLS-level VPNs (WireGuard, OpenVPN in TLS mode)
+
+2. **Docker Bridge Networking**:
+   - Docker proxy rewrites TCP headers
+   - **Mitigation**: Use `--network=host` mode (required for JA4TCP)
+
+3. **TLS Proxies (Corporate MITM)**:
+   - Proxy re-encrypts with its own TLS stack
+   - **Detection**: JA4 will show proxy signature, not client's
+
+#### 2.6.2 Future Protocol Changes
+
+1. **ECH (Encrypted ClientHello)**:
+   - When widely adopted, will encrypt SNI and some extensions
+   - **Impact**: JA4 still possible but with reduced information
+
+2. **TLS 1.3 0-RTT**:
+   - Early data sent before full handshake
+   - **Impact**: No change—ClientHello still required
+
+3. **QUIC (HTTP/3)**:
+   - Uses UDP instead of TCP
+   - **Impact**: JA4TCP not applicable, but JA4 and JA4H still work (with protocol flag `q` instead of `t`)
+
+### 2.7 Summary: Why Fingerprinting is Possible
+
+| Layer | Protocol | Why Observable | Why Fingerprintable | Key Data |
+|-------|----------|----------------|---------------------|----------|
+| **Layer 4** | TCP | Unencrypted handshake, kernel visibility | OS-specific defaults, option ordering | SYN options, window size, MSS |
+| **Layer 6** | TLS | Unencrypted ClientHello (pre-negotiation) | Library-specific cipher/extension preferences | Cipher suites, extensions, versions |
+| **Layer 7** | HTTP | NGINX terminates TLS (decrypts all traffic) | Browser-specific header ordering | Method, headers, HTTP version |
+
+**The Core Truth**: 
+> Fingerprinting works because clients must **honestly advertise their capabilities** to successfully establish connections. Spoofing requires controlling multiple protocol layers simultaneously—a task most bots and automation tools cannot achieve without sophisticated engineering.
+
+---
+
+## 3. Network Fundamentals
 
 To understand how the JA4 module operates, we must first understand the networking stack it interacts with.
 
-### 2.1 The OSI Model
+### 3.1 The OSI Model
 
 The **OSI (Open Systems Interconnection) Model** is a 7-layer framework describing how data travels from an application on one computer to an application on another.
 
@@ -36,7 +503,7 @@ The **OSI (Open Systems Interconnection) Model** is a 7-layer framework describi
 
 **Key Insight**: The JA4 module now operates at **Layers 4-7**, capturing TCP SYN data (Layer 4), TLS handshake data (Layer 6), and HTTP headers (Layer 7) for comprehensive client fingerprinting.
 
-### 2.2 TCP Connection Establishment
+### 3.2 TCP Connection Establishment
 
 Before any TLS handshake can occur, a reliable TCP connection must be established using the **3-Way Handshake**.
 
@@ -63,7 +530,7 @@ sequenceDiagram
 
 **JA4 Module Action**: At this point, Nginx accepts the connection. The module observes the socket state to determine if the connection is TCP or QUIC (for the `t`/`q` flag in the fingerprint).
 
-### 2.3 The TLS Handshake - Complete Lifecycle
+### 3.3 The TLS Handshake - Complete Lifecycle
 
 Once the TCP connection is established, the **TLS (Transport Layer Security) Handshake** begins. This is where encryption parameters are negotiated.
 
@@ -94,11 +561,11 @@ sequenceDiagram
 
 ---
 
-## 3. ClientHello Message - The Foundation of JA4
+## 4. ClientHello Message - The Foundation of JA4
 
 The **ClientHello** is the first message sent by a client during the TLS handshake. It contains all the information needed to create a JA4 fingerprint.
 
-### 3.1 Browser Connection Flow (Complete Step-by-Step)
+### 4.1 Browser Connection Flow (Complete Step-by-Step)
 
 Before examining the ClientHello structure in detail, let's understand the complete flow when a browser navigates to `https://example.com`:
 
@@ -136,7 +603,7 @@ sequenceDiagram
 
 **Key Point**: The ClientHello is sent **unencrypted** (in standard TLS), so any middlebox (including the JA4 module) can inspect it.
 
-### 3.2 ClientHello Byte-Level Structure
+### 4.2 ClientHello Byte-Level Structure
 
 The ClientHello is a precisely formatted binary message. Here's the complete structure:
 
@@ -184,7 +651,7 @@ Offset   Hex Dump                                         ASCII
 - **Offset 004c-004d**: Cipher suite count
 - **Extensions** start after compression methods
 
-### 3.3 Core Components Breakdown
+### 4.3 Core Components Breakdown
 
 #### 1. Random (32 Bytes)
 **Purpose**: Prevents replay attacks and contributes to key generation.
@@ -246,7 +713,7 @@ Hex Code  | Name
 - Sorts remaining ciphers numerically
 - Hashes the sorted list with SHA256
 
-### 3.4 Extensions Deep Dive
+### 4.4 Extensions Deep Dive
 
 #### Extension Format (Type-Length-Value)
 Each extension follows this structure:
@@ -350,7 +817,7 @@ fe 0d           Extension Type: ECH (0xfe0d)
 - Supported by: Cloudflare, Fastly
 - Not yet widespread
 
-### 3.5 Complete Extension Reference Table
+### 4.5 Complete Extension Reference Table
 
 | Extension Hex | Name | Purpose |  Usage |
 |---------------|------|---------|-----------|  
@@ -381,7 +848,7 @@ fe 0d           Extension Type: ECH (0xfe0d)
 - ❌ **Remove ALPN**: `0x0010` (optional, depending on spec)
 - ✅ **Keep all others** for hashing
 
-### 3.6 GREASE - The Anti-Ossification Mechanism
+### 4.6 GREASE - The Anti-Ossification Mechanism
 
 **GREASE (Generate Random Extensions And Sustain Extensibility)** is a clever trick used by modern browsers to prevent servers from rejecting unknown values.
 
@@ -397,11 +864,11 @@ fe 0d           Extension Type: ECH (0xfe0d)
 
 ---
 
-## 4. Module Architecture & Intervention
+## 5. Module Architecture & Intervention
 
 Now that we understand the network fundamentals, let's examine how the `ja4-nginx-module` integrates into Nginx.
 
-### 4.1 Nginx Request Processing Pipeline
+### 5.1 Nginx Request Processing Pipeline
 
 Nginx processes requests through a series of **phases**. The JA4 module hooks into two specific phases:
 
@@ -461,7 +928,7 @@ sequenceDiagram
 
 
 
-### 4.2 Intervention Point #1: SSL ClientHello Callback
+### 5.2 Intervention Point #1: SSL ClientHello Callback
 
 **When**: During the TLS handshake, immediately after receiving the ClientHello message.
 
@@ -490,7 +957,7 @@ int ngx_ja4_client_hello_cb(SSL *s, int *al, void *arg) {
 }
 ```
 
-### 4.3 Intervention Point #2: HTTP Access Phase
+### 5.3 Intervention Point #2: HTTP Access Phase
 
 **When**: After TLS is established and HTTP headers are parsed, before content is generated.
 
@@ -522,9 +989,9 @@ static ngx_int_t ngx_http_ja4_access_handler(ngx_http_request_t *r) {
 
 ---
 
-## 5. JA4 Algorithm - Complete Breakdown
+## 6. JA4 Algorithm - Complete Breakdown
 
-### 5.1 JA4 Fingerprint Format
+### 6.1 JA4 Fingerprint Format
 
 **Structure**: `tvaaii_cccccc_eeeeee`
 
@@ -542,7 +1009,7 @@ static ngx_int_t ngx_http_ja4_access_handler(ngx_http_request_t *r) {
 
 **Example**: `t13d0812_e27c1ff97fe7_a1b2c3d4e5f6`
 
-### 5.2 Complete Calculation Walkthrough
+### 6.2 Complete Calculation Walkthrough
 
 Let's fingerprint a **Chrome 120** connection to `https://example.com`.
 
@@ -664,7 +1131,7 @@ eeeeee = a1b2c3d4e5f6
 Final: t13d0709_e27c1ff97fe7_a1b2c3d4e5f6
 ```
 
-### 5.3 JA4H (HTTP Fingerprint)
+### 6.3 JA4H (HTTP Fingerprint)
 
 **Format**: `MMVVCHH_HHHHHHHHHHHH`
 
@@ -701,7 +1168,7 @@ Upgrade-Insecure-Requests: 1
 
 **Final**: `ge11c08_b3a8c5d2e1f4a7b9c3d5e7f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7`
 
-### 5.4 JA4ONE (Combined Fingerprint)
+### 6.4 JA4ONE (Combined Fingerprint)
 
 **Format**: `JA4_JA4H`
 
@@ -719,9 +1186,9 @@ JA4ONE: t13d0709_e27c1ff97fe7_a1b2c3d4e5f6_ge11c08_b3a8c5d2e1f4a7b9c3d5e7f1a3b5c
 
 ---
 
-## 5.5 JA4TCP (TCP Fingerprint) - **NEW**
+## 6.5 JA4TCP (TCP Fingerprint) - **NEW**
 
-### 5.5.1 What is JA4TCP?
+### 6.5.1 What is JA4TCP?
 
 **JA4TCP** is a **Layer 4 (Transport Layer)** fingerprinting technique that analyzes the TCP SYN packet to identify client characteristics at the network stack level. While JA4 focuses on TLS (Layer 6) and JA4H on HTTP (Layer 7), JA4TCP operates at the TCP layer, making it the **earliest detection point** in the connection lifecycle.
 
@@ -731,7 +1198,7 @@ JA4ONE: t13d0709_e27c1ff97fe7_a1b2c3d4e5f6_ge11c08_b3a8c5d2e1f4a7b9c3d5e7f1a3b5c
 - **NAT/Proxy Detection**: Can identify if traffic is being proxied or NAT'd
 - **Pre-TLS Fingerprinting**: Works even for non-HTTPS traffic (HTTP, FTP, etc.)
 
-### 5.5.2 TCP SYN Packet Structure
+### 6.5.2 TCP SYN Packet Structure
 
 The TCP SYN packet is the **first packet** sent during the TCP 3-way handshake. It contains critical fingerprinting data in its options field.
 
@@ -760,7 +1227,7 @@ The TCP SYN packet is the **first packet** sent during the TCP 3-way handshake. 
 - **Data Offset** (4 bits): TCP header length (includes options)
 - **Options** (variable): TCP options in Type-Length-Value format
 
-### 5.5.3 TCP Options Deep Dive
+### 6.5.3 TCP Options Deep Dive
 
 TCP Options follow a **Type-Length-Value (TLV)** encoding scheme.
 
@@ -796,7 +1263,7 @@ Raw Hex: 02 04 05 b4 04 02 08 0a 12 34 56 78 00 00 00 00 01 03 03 07
 - **MSS**: `1460`
 - **Window Scale**: `7`
 
-### 5.5.4 JA4TCP Fingerprint Format
+### 6.5.4 JA4TCP Fingerprint Format
 
 **Structure**: `w_o_m_s`
 
@@ -809,7 +1276,7 @@ Raw Hex: 02 04 05 b4 04 02 08 0a 12 34 56 78 00 00 00 00 01 03 03 07
 
 **Complete Example**: `65535_2-1-3-1-1-4_1460_7`
 
-### 5.5.5 How NGINX Captures TCP SYN Data
+### 6.5.5 How NGINX Captures TCP SYN Data
 
 The module uses Linux's `TCP_SAVE_SYN` socket option to access the raw SYN packet.
 
@@ -866,7 +1333,7 @@ sequenceDiagram
     NGINX->>Client: HTTP Response + X-JA4TCP-Fingerprint header
 ```
 
-### 5.5.6 Complete Calculation Walkthrough
+### 6.5.6 Complete Calculation Walkthrough
 
 Let's fingerprint a **Chrome 120 on Linux** connection.
 
@@ -973,19 +1440,45 @@ last = ngx_snprintf(last, ..., "_%d_%d", mss, scale);
 
 **Final Fingerprint**: `65535_2-4-8-3_65495_7`
 
-### 5.5.7 OS & Browser Signatures
+### 6.5.7 OS & Browser Signatures
 
-Different platforms produce distinct fingerprints:
+Different platforms and applications produce distinct TCP fingerprints. The values below are representative examples and may vary based on specific OS versions, kernel configurations, and network settings.
 
 | Client | Fingerprint | Notes |
 |--------|-------------|-------|
-| **Chrome/Linux** | `65535_2-4-8-3_1460_7` | Standard Ethernet MTU (1500) |
-| **Chrome/Windows** | `8192_2-4-5-1-3-3-8-1_1460_8` | Different window, scale, option order |
-| **curl (Linux)** | `65495_2-4-8-3_65495_7` | Often uses loopback MTU |
-| **Python requests** | `29200_2-4-5-4-2-8-10_1460_7` | Smaller default window |
-| **iOS Safari** | `65535_2-4-8-3_1440_4` | Slightly smaller MSS |
+| **Chrome/Windows 10** | `8192_2-1-3-1-1-8-1-1_1460_8` | Standard Windows 10 TCP stack, autotuning enabled |
+| **Chrome/Linux (Ubuntu 22.04)** | `64240_2-4-8-1-3_1460_7` | Modern Linux kernel with larger default window |
+| **Chrome/macOS (Ventura)** | `65535_2-3-4-1-1-8_1440_4` | BSD-derived stack, slightly smaller MSS |
+| **curl (Linux)** | `64240_2-4-8-1-3_1460_7` | Uses OS defaults (matches Linux browsers) |
+| **Python requests (Linux)** | `29200_2-4-8-1-3_1460_7` | Smaller custom window, uses OS option ordering |
+| **Go net/http (Linux)** | `64240_2-4-8-1-3_1460_7` | Inherits from Go runtime but uses OS TCP stack |
+| **Loopback (127.0.0.1)** | `65535_2-4-8-3_65496_7` | Loopback interface MTU is 65536, MSS = 65536 - 40 = 65496 |
 
-### 5.5.8 Integration with JA4 Suite
+**Important Notes**:
+
+1. **Version-Dependent**: TCP window sizes changed significantly across OS versions:
+   - Windows XP/2003: 65,535 bytes or 17,520 bytes
+   - Windows 7+: 8,192 bytes (current standard)
+   - Linux 2.4/2.6: ~5,840 bytes
+   - Modern Linux (3.x+): 64,240+ bytes
+
+2. **Configuration-Dependent**: System administrators can modify TCP parameters via:
+   - Linux: `/proc/sys/net/ipv4/tcp_rmem`, `/proc/sys/net/ipv4/tcp_wmem`
+   - Windows: Registry keys under `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`
+   - macOS: `sysctl` parameters
+
+3. **Network-Dependent**: MSS values vary by network interface:
+   - Ethernet (MTU 1500): MSS = 1460 bytes (1500 - 20 IP - 20 TCP)
+   - Loopback (MTU 65536): MSS = 65496 bytes (65536 - 40)
+   - Jumbo Frames (MTU 9000): MSS = 8960 bytes
+
+4. **References**: 
+   - [p0f v3 Database](http://lcamtuf.coredump.cx/p0f3/) - Passive OS fingerprinting signatures
+   - [Nmap OS Detection](https://nmap.org/book/osdetect.html) - Active OS fingerprinting methodology
+   - [RFC 793](https://tools.ietf.org/html/rfc793) - Transmission Control Protocol specification
+   - [RFC 7323](https://tools.ietf.org/html/rfc7323) - TCP Extensions for High Performance
+
+### 6.5.8 Integration with JA4 Suite
 
 JA4TCP complements existing fingerprints:
 
@@ -1010,7 +1503,7 @@ graph TD
 **Example Multi-Layer Detection**:
 ```
 Client Claims: Chrome 120 / Windows 11
-JA4TCP: 8192_2-4-5-1-3-3-8-1_1460_8  ✅ Matches Windows
+JA4TCP: 8192_2-1-3-1-1-8-1-1_1460_8  ✅ Matches Windows 10/11
 JA4:    t13d1012_...                 ✅ Matches Chrome 120
 JA4H:   ge11c08_...                  ✅ Matches Chrome Headers
 
@@ -1019,15 +1512,26 @@ JA4H:   ge11c08_...                  ✅ Matches Chrome Headers
 
 **Bot Detection**:
 ```
-Client Claims: Chrome 120 / Windows 11
-JA4TCP: 29200_2-4-8-3_1460_7         ❌ Python-like
-JA4:    t12i0508_...                 ❌ Curl-like
-JA4H:   ge11n03_...                  ⚠️  No cookies (suspicious)
+Client Claims: Chrome 120 / Windows 11 (fake User-Agent)
+JA4TCP: 29200_2-4-8-1-3_1460_7       ❌ Python-like (small window)
+JA4:    t12i0508_...                 ❌ Curl-like (old TLS, no SNI)
+JA4H:   ge11n03_...                  ⚠️  Only 3 headers (suspicious)
+                                      ⚠️  No cookies (Chrome always has some)
 
-→ VERDICT: Bot spoofing User-Agent
+→ VERDICT: Bot (Python requests) spoofing User-Agent
 ```
 
-### 5.5.9 Limitations & Considerations
+**Cross-Platform Mismatch Detection**:
+```
+Client Claims: Safari / iOS 15
+JA4TCP: 64240_2-4-8-1-3_1460_7       ❌ Linux signature (Ubuntu)
+JA4:    t13d0912_...                 ✅ Could match Safari
+JA4H:   ge20c12_...                  ⚠️  HTTP/2 with Linux-like headers
+
+→ VERDICT: Linux bot pretending to be iOS Safari
+```
+
+### 6.5.9 Limitations & Considerations
 
 **Docker Networking**:
 - **Bridge Mode**: Module sees Docker Proxy's fingerprint (all clients identical)
@@ -1038,13 +1542,13 @@ JA4H:   ge11n03_...                  ⚠️  No cookies (suspicious)
 - Use X-Forwarded-For headers or direct routing when possible
 
 **Loopback Testing**:
-- Loopback interface (127.0.0.1) uses MTU 65536, resulting in MSS ~65495
+- Loopback interface (127.0.0.1) uses MTU 65536, resulting in MSS 65496 (65536 - 40)
 - Production fingerprints will show standard Ethernet MSS (1460) or jumbo frames (8960)
 
 ---
 
 
-## 6. Use Cases & Security Benefits
+## 7. Use Cases & Security Benefits
 
 ### Bot Detection
 - **Problem**: Malicious bots scrape content, perform credential stuffing, or DDoS attacks
@@ -1068,7 +1572,7 @@ JA4H:   ge11n03_...                  ⚠️  No cookies (suspicious)
 ---
 
 
-## 7. Conclusion
+## 8. Conclusion
 
 The `ja4-nginx-module` provides a powerful, multi-layer fingerprinting mechanism that operates across the network stack, making it highly resilient to spoofing attempts. By understanding the OSI model, TCP/TLS handshakes, and the precise intervention points, you can effectively deploy this module to enhance your application's security posture.
 

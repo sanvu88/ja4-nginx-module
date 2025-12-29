@@ -3,7 +3,7 @@
 ## Overview
 This Nginx module implements **JA4**, **JA4H**, and **JA4one** fingerprinting standards for HTTP and TLS clients. It enables you to identify and fingerprint incoming requests based on their TLS handshake (Client Hello) and HTTP headers.
 
-<img width="1551" height="469" alt="image_2025-12-28_00-08-28" src="https://github.com/user-attachments/assets/5d8cbef6-496f-4910-96e9-f3ddf3cd3758" />
+<img width="1546" height="406" alt="image" src="https://github.com/user-attachments/assets/1dcb5a00-e2cc-4e5e-be38-dd62ac0cf11f" />
 
 
 This module is designed for:
